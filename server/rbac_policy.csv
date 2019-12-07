@@ -1,0 +1,3 @@
+p, alice, data1, permit
+p, alice, data1, unpermit
+g, alice, admin1

@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+import "google/api/annotations.proto";
+
+message AccessControlReq {
+    string sub = 1;
+    string obj = 2;
+    string act = 3;
+}
+
+message AccessControlResp {
+    bool res = 1;
+}
+
+message StringMessage {
+    string value = 1;
+}
+
+service AccessControl {
+    rpc Check(AccessControlReq) returns (AccessControlResp);
+    rpc Echo(StringMessage) returns (StringMessage) {
+        option (google.api.http) = {
+            post: "/v1/example/echo"
+            body: "*"
+        };
+    }
+}
