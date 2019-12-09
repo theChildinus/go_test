@@ -1,139 +1,244 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"github.com/ldsec/lattigo/bfv"
-	"log"
+	"io/ioutil"
+	"net/http"
+	"strings"
 )
 
-type BFVObject struct {
-	Params       bfv.Parameters
-	BfvContext   *bfv.BfvContext
-	Encoder      *bfv.BatchEncoder
-	Kgen         *bfv.KeyGenerator
-	Encryptor    *bfv.Encryptor
-	Decryptor    *bfv.Decryptor
-	EncryptorPk  *bfv.Encryptor
-	EncryptorSk  *bfv.Encryptor
-	Evaluator    *bfv.Evaluator
+var bfvobj *BFVObject
+
+type EncryptReq struct {
+	PublishPkFile string `json:"publish_pk_file"`
+	Plaintext string `json:"plaintext"`
 }
 
-type PublishKeyStore struct {
-	Username     string
-	Sk           *bfv.SecretKey
-	Pk           *bfv.PublicKey
+type EncryptResp struct {
+	Ciphertext string `json:"ciphertext"`
 }
 
-type SubsrcibeKeyStore struct {
-	Username     string
-	Sk           *bfv.SecretKey
-	Switchingkey *bfv.SwitchingKey
+type DecryptReq struct {
+	SubscribeSkFile string `json:"subscribe_sk_file"`
+	SubscribeSwkFile string `json:"subscribe_swk_file"`
+	Ciphertext string `json:"ciphertext"`
 }
 
-func NewBFVObject(paramsNum int) *BFVObject {
-	b := &BFVObject{}
-	var err error
-	b.Params = bfv.DefaultParams[paramsNum]
-	b.Params.T = 67084289
-	b.BfvContext, err = bfv.NewBfvContextWithParam(&b.Params)
-	if err != nil {
-		fmt.Println("New BfvContext Error: ", err.Error())
-	}
-
-	b.Encoder, err = b.BfvContext.NewBatchEncoder()
-	if err != nil {
-		fmt.Println(err.Error())
-	}
-	b.Kgen = b.BfvContext.NewKeyGenerator()
-	return b
+type DecryptResp struct {
+	Plaintext string `json:"plaintext"`
 }
 
-func NewPublicKeyStore(username string, b *BFVObject) *PublishKeyStore {
-	var err error
+type NewPKSReq struct {
+	Username string `json:"username"`
+}
+
+type NewSKSReq struct {
+	Username string `json:"username"`
+	PKSname string `json:"publish_sk_file"`
+}
+
+type CommonResp struct {
+	Code string `json:"code"`
+}
+
+// 加密函数 发布者使用自己的公钥加密
+func encryptFunc(w http.ResponseWriter, r *http.Request) {
+	body, _ := ioutil.ReadAll(r.Body)
+	body_str := string(body)
+	fmt.Println("[ENCRYPT]: ", body_str)
+
+	er := &EncryptReq{}
 	pks := &PublishKeyStore{}
-	pks.Username = username
-	pks.Sk, pks.Pk = b.Kgen.NewKeyPair()
-
-	b.EncryptorPk, err = b.BfvContext.NewEncryptorFromPk(pks.Pk)
-	if err != nil {
-		log.Fatal(err)
+	if err := json.Unmarshal(body, &er); err == nil {
+		// read publisher's PK from file
+		bytes_pub_pk, err := base64.StdEncoding.DecodeString(ReadFromFile(er.PublishPkFile))
+		pk := bfvobj.Kgen.NewPublicKeyEmpty()
+		err = pk.UnMarshalBinary(bytes_pub_pk)
+		if err != nil {
+			fmt.Println("[ENCRYPT]: ", err.Error())
+		}
+		pks.Pk = pk
+		// encrypt by PK
+		ciphertext := Encrypt(bfvobj, pks, er.Plaintext)
+		resp := &EncryptResp{Ciphertext:base64.StdEncoding.EncodeToString(ciphertext)}
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
+	} else {
+		resp := &CommonResp{"-1"}
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
 	}
-
-	b.EncryptorSk, err = b.BfvContext.NewEncryptorFromSk(pks.Sk)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	b.Evaluator = b.BfvContext.NewEvaluator()
-
-	fmt.Printf("Parameters : N=%d, T=%d, logQ = %d (%d limbs), sigma = %f \n",
-		b.BfvContext.N(), b.BfvContext.T(), b.BfvContext.LogQ(), len(b.Params.Qi), b.BfvContext.Sigma())
-	return pks
 }
 
-func NewSubsrcibeKeyStore(username string, b *BFVObject, pks *PublishKeyStore) *SubsrcibeKeyStore {
+// 解密函数 订阅者使用自己的私钥解密
+func decryptFunc(w http.ResponseWriter, r *http.Request) {
+	body, _ := ioutil.ReadAll(r.Body)
+	body_str := string(body)
+	fmt.Println("[DECRYPT]: ",body_str)
+
+	dr := &DecryptReq{}
 	sks := &SubsrcibeKeyStore{}
-	sks.Username = username
-	sks.Sk = b.Kgen.NewSecretKey()
+	if err := json.Unmarshal(body, &dr); err == nil {
+		// read subscriber's SK from file
+		bytes_sub_sk, err := base64.StdEncoding.DecodeString(ReadFromFile(dr.SubscribeSkFile))
+		sk := bfvobj.Kgen.NewSecretKeyEmpty()
+		err = sk.UnMarshalBinary(bytes_sub_sk)
+		if err != nil {
+			fmt.Println("[DECRYPT]: ", err.Error())
+		}
+		// read subscriber's SwitchKey from file
+		bytes_sub_swk, err := base64.StdEncoding.DecodeString(ReadFromFile(dr.SubscribeSwkFile))
+		swk := bfvobj.Kgen.NewSwitchingKeyEmpty(uint64(0))
+		err = swk.UnMarshalBinary(bytes_sub_swk)
+		if err != nil {
+			fmt.Println("[DECRYPT]: ", err.Error())
+		}
 
-	bitDecomp := uint64(0)
-	sks.Switchingkey = b.Kgen.NewSwitchingKey(pks.Sk, sks.Sk, bitDecomp)
-	return sks
+		sks.Sk = sk
+		sks.Switchingkey = swk
+		// decrypt by SK
+		ciphertext, _ := base64.StdEncoding.DecodeString(dr.Ciphertext)
+		plaintext := Decrypt(bfvobj, sks, ciphertext)
+		resp := &DecryptResp{Plaintext:plaintext}
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
+	} else {
+		resp := &CommonResp{"-1"}
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
+	}
 }
 
-func Encrypt(b *BFVObject, pks *PublishKeyStore, plaintext string) []byte {
-	bytes := []byte(plaintext)
-	alice := make([]uint64, b.Params.N)
-	for i := uint64(0); i < uint64(len(bytes)); i++ {
-		alice[i] = uint64(bytes[i])
-	}
+// 产生发布者的公钥(PK)和私钥(SK)
+func newPublishKeyStore(w http.ResponseWriter, r *http.Request) {
+	body, _ := ioutil.ReadAll(r.Body)
+	body_str := string(body)
+	fmt.Println("[NEW PKS]: ",body_str)
 
-	alicePlaintext := b.BfvContext.NewPlaintext()
-	_ = b.Encoder.EncodeUint(alice, alicePlaintext)
+	pks := &NewPKSReq{}
+	resp := &CommonResp{}
+	if err := json.Unmarshal(body, &pks); err == nil {
+		// generate publisher's SK and PK
+		store := NewPublishKeyStore(bfvobj)
 
-	fmt.Println("Encrypting...")
+		// write to file
+		bytesPk, err := store.Pk.MarshalBinary()
+		if err != nil {
+			fmt.Println("[NEW PKS]: ", err.Error())
+		}
 
-	aliceCiphertext, err := b.EncryptorPk.EncryptNew(alicePlaintext)
-	if err != nil {
-		fmt.Println(err.Error())
+		bytesSk, err := store.Sk.MarshalBinary()
+		if err != nil {
+			fmt.Println("[NEW PKS]: ", err.Error())
+		}
+
+		WriteToFile(pks.Username + ".pk", base64.StdEncoding.EncodeToString(bytesPk))
+		WriteToFile(pks.Username + ".sk", base64.StdEncoding.EncodeToString(bytesSk))
+		resp.Code = "0"
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
+	} else {
+		resp.Code = "-1"
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
 	}
-	cipherBytes, err := aliceCiphertext.MarshalBinary()
-	if err != nil {
-		fmt.Println(err.Error())
-	}
-	fmt.Println(cipherBytes)
-	return cipherBytes
 }
 
-func Decrypt(b *BFVObject, sks *SubsrcibeKeyStore, ciphertext []byte) string {
-	aliceCiphertext := b.BfvContext.NewCiphertext(1)
-	err := aliceCiphertext.UnMarshalBinary(ciphertext)
-	if err != nil {
-		fmt.Println("UnMarshal Failed ", err.Error())
-	}
+// 利用发布者私钥(SK) 产生订阅者的私钥(SK)和交换密钥(SwithchKey)
+func newSubsrcibeKeyStore(w http.ResponseWriter, r *http.Request) {
+	body, _ := ioutil.ReadAll(r.Body)
+	body_str := string(body)
+	fmt.Println("[NEW SKS]: ", body_str)
 
-	if err := b.Evaluator.SwitchKeys(aliceCiphertext, sks.Switchingkey, aliceCiphertext); err != nil {
-		fmt.Println(err.Error())
-	}
+	sks := &NewSKSReq{}
+	pks := &PublishKeyStore{}
+	resp := &CommonResp{}
+	if err := json.Unmarshal(body, &sks); err == nil {
+		// read publisher's SK from file
+		bytes_pub_sk, err := base64.StdEncoding.DecodeString(ReadFromFile(sks.PKSname))
+		sk := bfvobj.Kgen.NewSecretKeyEmpty()
+		err = sk.UnMarshalBinary(bytes_pub_sk)
+		if err != nil {
+			fmt.Println("[NEW SKS]: ", err.Error())
+		}
+		pks.Sk = sk
+		// generate subscriber's SK and SwitchKey
+		store := NewSubsrcibeKeyStore(bfvobj, pks)
 
-	decryptor_sks, err := b.BfvContext.NewDecryptor(sks.Sk)
-	if err != nil {
-		fmt.Println(err.Error())
+		// write to file
+		bytes_sub_sk, err := store.Sk.MarshalBinary()
+		if err != nil {
+			fmt.Println("[NEW SKS]: ", err.Error())
+		}
+		bytes_sub_switchkey, err := store.Switchingkey.MarshalBinary()
+		if err != nil {
+			fmt.Println("[NEW SKS]: ", err.Error())
+		}
+
+		WriteToFile(sks.Username + ".sk", base64.StdEncoding.EncodeToString(bytes_sub_sk))
+		WriteToFile(sks.Username + ".swk", base64.StdEncoding.EncodeToString(bytes_sub_switchkey))
+		resp.Code = "0"
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
+	} else {
+		resp.Code = "-1"
+		ret, _ := json.Marshal(resp)
+		_, _ = fmt.Fprint(w, string(ret))
 	}
-	aliceWant := b.Encoder.DecodeUint(decryptor_sks.DecryptNew(aliceCiphertext))
-	result := make([]byte, len(aliceWant))
-	for i := 0; i < len(aliceWant); i++ {
-		result[i] = byte(aliceWant[i])
-	}
-	fmt.Println("Result: ", result)
-	return string(result)
 }
+
+func ReadFromFile(filename string) string {
+	contents, err := ioutil.ReadFile(filename)
+	if err == nil {
+		//因为contents是[]byte类型，直接转换成string类型后会多一行空格,需要使用strings.Replace替换换行符
+		result := strings.Replace(string(contents),"\n","",1)
+		return result
+	}
+	return ""
+}
+
+func WriteToFile(filename, content string) {
+	data :=  []byte(content)
+	if ioutil.WriteFile(filename, data,0644) == nil {
+		fmt.Println("Write To File ", filename, " Success")
+	}
+}
+
 
 func main() {
-	bfvobj := NewBFVObject(0)
-	pks := NewPublicKeyStore("pub1", bfvobj)
-	sks := NewSubsrcibeKeyStore("sub1", bfvobj, pks)
-	ciphertext := Encrypt(bfvobj, pks, "HELLO HFE")
-	plainttext := Decrypt(bfvobj, sks, ciphertext)
-	fmt.Println(plainttext)
+
+	bfvobj = NewBFVObject(0)
+
+	//pks := NewPublishKeyStore(bfvobj)
+	//bytesPk, err := pks.Pk.MarshalBinary()
+	//if err != nil {
+	//	fmt.Println("[NEW PKS]: ", err.Error())
+	//}
+	//
+	//bytesSk, err := pks.Sk.MarshalBinary()
+	//if err != nil {
+	//	fmt.Println("[NEW PKS]: ", err.Error())
+	//}
+	//
+	//WriteToFile("pub1.pk", base64.StdEncoding.EncodeToString(bytesPk))
+	//WriteToFile("pub1.sk", base64.StdEncoding.EncodeToString(bytesSk))
+	//
+	//bytes_pub_sk, err := base64.StdEncoding.DecodeString(ReadFromFile("pub1.sk"))
+	//SkTest := bfvobj.Kgen.NewSecretKeyEmpty()
+	//SkTest.UnMarshalBinary(bytes_pub_sk)
+	//sks := NewSubsrcibeKeyStore(bfvobj, &PublishKeyStore{Sk: SkTest, Pk: nil})
+	//ciphertext := Encrypt(bfvobj, pks, "HELLO HFE")
+	//plaintext := Decrypt(bfvobj, sks, ciphertext)
+	//fmt.Println(plaintext)
+
+	http.HandleFunc("/encrypt", encryptFunc)
+	http.HandleFunc("/decrypt", decryptFunc)
+	http.HandleFunc("/newpks", newPublishKeyStore)
+	http.HandleFunc("/newsks", newSubsrcibeKeyStore)
+	fmt.Println("HE Service Listen On localhost:55344...")
+	if err := http.ListenAndServe("localhost:55344", nil); err != nil {
+		fmt.Println("ListenAndServe: ", err)
+	}
 }
